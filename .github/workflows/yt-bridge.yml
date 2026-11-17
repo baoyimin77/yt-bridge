@@ -1,0 +1,88 @@
+# YouTube 下载桥接测试 —— GitHub Actions 路线
+# 用法：把本文件放到用户 GitHub 仓库的 .github/workflows/yt-bridge.yml
+# 在 Actions 页手动 Run workflow，填一条视频 URL。
+# 它做的事：装 yt-dlp → 裸下载（不用任何 cookie/登录态）→ 算 md5/大小/时长
+# → 把文件传到 tmpfiles（失败退 catbox）→ 把直链写进本次运行的 Summary。
+# 目的只有一个：验 GitHub Actions 的出口过不过 YouTube 机器人检查，
+# 以及下完的文件能不能给 Box 一个直链拉回。
+
+name: yt-bridge-download
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "要下载的视频页面 URL（只测 1 条小样）"
+        required: true
+        type: string
+      max_height:
+        description: "最高画质（高）"
+        required: false
+        default: "480"
+        type: string
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install yt-dlp
+        run: |
+          python3 -m pip install -q yt-dlp
+          yt-dlp --version
+
+      - name: Download (no cookies, bare exit test)
+        id: dl
+        run: |
+          set +e
+          yt-dlp -f "bv*[height<=${{ inputs.max_height }}]+ba/b[height<=${{ inputs.max_height }}]" \
+            --no-playlist -o "sample.%(ext)s" "${{ inputs.video_url }}" 2>&1 | tee dl.log
+          code=${PIPESTATUS[0]}
+          if grep -qi "Sign in to confirm" dl.log; then
+            echo "verdict=BOT_BLOCKED" >> "$GITHUB_OUTPUT"
+            echo "## 结果：被机器人检查拦截" >> "$GITHUB_STEP_SUMMARY"
+            echo "出口没过，原文见日志（Sign in to confirm you're not a bot）。" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ $code -ne 0 ]; then
+            echo "verdict=DOWNLOAD_FAILED" >> "$GITHUB_OUTPUT"
+            echo "## 结果：下载失败（非机器人拦截）" >> "$GITHUB_STEP_SUMMARY"
+            tail -5 dl.log >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "verdict=OK" >> "$GITHUB_OUTPUT"
+
+      - name: Fingerprint and upload for direct link
+        if: steps.dl.outputs.verdict == 'OK'
+        run: |
+          f=$(ls sample.* | head -1)
+          size=$(stat -c%s "$f")
+          md5=$(md5sum "$f" | cut -d' ' -f1)
+          dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" || echo "unknown")
+          link=""
+          resp=$(curl -s -F "file=@$f" https://tmpfiles.org/api/v1/upload || true)
+          url=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('url',''))" 2>/dev/null || true)
+          if [ -n "$url" ]; then
+            link=$(echo "$url" | sed 's|https://tmpfiles.org/|https://tmpfiles.org/dl/|')
+            host="tmpfiles"
+          else
+            link=$(curl -s -F "reqtype=fileupload" -F "fileToUpload=@$f" https://catbox.moe/user/api.php || true)
+            host="catbox"
+          fi
+          {
+            echo "## 结果：下载成功"
+            echo "- 源视频：${{ inputs.video_url }}"
+            echo "- 文件：$f"
+            echo "- 字节数：$size"
+            echo "- md5：$md5"
+            echo "- 时长（秒）：$dur"
+            echo "- 直链（$host）：$link"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Backup artifact (needs GitHub login to fetch, optional)
+        if: steps.dl.outputs.verdict == 'OK'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sample-video
+          path: sample.*
+          retention-days: 7
